@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Manage Claude Code saved chats: list, rename, delete, move.
+
+Chats live in ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl, with an
+optional sibling <session-id>/ directory (subagents, tool results).
+
+  claude-chats list [-p PROJECT] [-a] [-n N]
+  claude-chats rename ID TITLE
+  claude-chats delete ID [ID...] [-y]
+  claude-chats move ID [ID...] DEST_DIR [-y]
+
+ID may be any unambiguous prefix of the session id. PROJECT filters on a
+substring of the project path.
+"""
+import argparse
+import json
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path.home() / ".claude" / "projects"
+
+
+def encode(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def scan(path):
+    """Return (title, cwd, first_prompt, nmsgs) from one transcript."""
+    custom = agent = ai = cwd = first = None
+    n = 0
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            t = o.get("type")
+            if t == "custom-title":
+                custom = o.get("customTitle") or custom
+            elif t == "agent-name":
+                agent = o.get("agentName") or agent
+            elif t == "ai-title":
+                ai = o.get("aiTitle") or ai
+            elif t in ("user", "assistant"):
+                n += 1
+                cwd = cwd or o.get("cwd")
+                if t == "user" and first is None and not o.get("isSidechain"):
+                    c = o.get("message", {}).get("content")
+                    if isinstance(c, list):
+                        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+                    if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
+                        first = " ".join(c.split())
+    return custom or agent or ai or "", cwd, first or "", n
+
+
+def chats():
+    for f in ROOT.glob("*/*.jsonl"):
+        yield f
+
+
+def resolve(prefix):
+    hits = [f for f in chats() if f.stem.startswith(prefix)]
+    if not hits:
+        sys.exit(f"no chat matches '{prefix}'")
+    if len(hits) > 1:
+        sys.exit(f"'{prefix}' is ambiguous: " + ", ".join(h.stem[:12] for h in hits))
+    return hits[0]
+
+
+def confirm(msg, yes):
+    return yes or input(f"{msg} [y/N] ").strip().lower() == "y"
+
+
+def cmd_list(a):
+    rows = []
+    cur = encode(Path.cwd())
+    for f in chats():
+        if a.project:
+            if a.project not in f.parent.name:
+                continue
+        elif not a.all and f.parent.name != cur:
+            continue
+        title, cwd, first, n = scan(f)
+        rows.append((f.stat().st_mtime, f, title, cwd, first, n))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    if a.limit:
+        rows = rows[: a.limit]
+    for mt, f, title, cwd, first, n in rows:
+        when = datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M")
+        kb = f.stat().st_size // 1024
+        print(f"{f.stem[:8]}  {when}  {n:>5} msgs {kb:>6}K  {title or '(untitled)'}")
+        print(f"          {cwd or f.parent.name}")
+        if not title and first:
+            print(f"          > {first[:90]}")
+    if not rows:
+        print("no chats (try -a for all projects)")
+
+
+def cmd_rename(a):
+    f = resolve(a.id)
+    rec = {"type": "custom-title", "customTitle": a.title, "sessionId": f.stem}
+    rec2 = {"type": "agent-name", "agentName": a.title, "sessionId": f.stem}
+    with open(f, "a") as fh:
+        fh.write(json.dumps(rec) + "\n" + json.dumps(rec2) + "\n")
+    print(f"renamed {f.stem[:8]} -> {a.title}")
+
+
+def cmd_delete(a):
+    for i in a.ids:
+        f = resolve(i)
+        title = scan(f)[0] or "(untitled)"
+        if not confirm(f"delete {f.stem[:8]} '{title}' in {f.parent.name}?", a.yes):
+            continue
+        f.unlink()
+        side = f.with_suffix("")
+        if side.is_dir():
+            shutil.rmtree(side)
+        print(f"deleted {f.stem[:8]}")
+
+
+def cmd_move(a):
+    dest = Path(a.dest).expanduser().resolve()
+    ddir = ROOT / encode(dest)
+    if not dest.is_dir():
+        print(f"warning: {dest} does not exist", file=sys.stderr)
+    for i in a.ids:
+        f = resolve(i)
+        if f.parent == ddir:
+            print(f"{f.stem[:8]} already in {dest}")
+            continue
+        if (ddir / f.name).exists():
+            print(f"skip {f.stem[:8]}: already exists in destination", file=sys.stderr)
+            continue
+        if not confirm(f"move {f.stem[:8]} from {f.parent.name} to {ddir.name}?", a.yes):
+            continue
+        ddir.mkdir(parents=True, exist_ok=True)
+        # rewrite cwd so --resume from the new directory sees consistent data
+        tmp = ddir / (f.name + ".tmp")
+        with open(f, errors="surrogateescape") as src, open(tmp, "w", errors="surrogateescape") as out:
+            for line in src:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    out.write(line)
+                    continue
+                if isinstance(o, dict) and "cwd" in o:
+                    o["cwd"] = str(dest)
+                    line = json.dumps(o, ensure_ascii=False) + "\n"
+                out.write(line)
+        tmp.replace(ddir / f.name)
+        f.unlink()
+        side = f.with_suffix("")
+        if side.is_dir():
+            shutil.move(str(side), str(ddir / side.name))
+        print(f"moved {f.stem[:8]} -> {dest}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("list", help="list chats (current dir by default)")
+    s.add_argument("-p", "--project", help="substring of project path")
+    s.add_argument("-a", "--all", action="store_true", help="all projects")
+    s.add_argument("-n", "--limit", type=int, help="show only the newest N")
+    s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("rename")
+    s.add_argument("id")
+    s.add_argument("title")
+    s.set_defaults(fn=cmd_rename)
+    s = sub.add_parser("delete")
+    s.add_argument("ids", nargs="+")
+    s.add_argument("-y", "--yes", action="store_true")
+    s.set_defaults(fn=cmd_delete)
+    s = sub.add_parser("move")
+    s.add_argument("ids", nargs="+", help="chat ids followed by destination dir")
+    s.add_argument("-y", "--yes", action="store_true")
+    s.set_defaults(fn=cmd_move)
+    a = p.parse_args()
+    if a.cmd == "move":
+        if len(a.ids) < 2:
+            p.error("move needs at least one ID and a DEST_DIR")
+        a.dest = a.ids.pop()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
