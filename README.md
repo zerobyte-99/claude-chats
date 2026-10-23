@@ -4,20 +4,25 @@ Small single-file Python tool (stdlib only) to **list, rename, delete and move**
 saved [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex) chats.
 
 ```bash
-claude-chats list                    # chats for the current directory (both tools)
+claude-chats list                    # Claude Code chats for the current directory
 claude-chats list -a -n 20           # 20 newest across all directories
-claude-chats list -t codex -p myapp  # only Codex, cwd containing "myapp"
+claude-chats list -p myapp           # working directory containing "myapp"
 claude-chats rename 4af8c6ed "Ollama tuning"
 claude-chats move 111bafee 4af8c6ed ~/other/project   # last arg is the destination
 claude-chats delete 16b74f11 -y
+
+codex-chats list -a                  # same commands, for Codex chats
 ```
 
+`codex-chats` is a symlink to the same script; the command name picks the tool.
 IDs are unambiguous prefixes of the session id (shown by `list`).
 
 ## Install
 
 ```bash
-install -m755 claude-chats ~/bin/    # or symlink it; make sure ~/bin is on PATH
+git clone https://github.com/zerobyte-99/claude-chats ~/claude-chats-repo
+ln -s ~/claude-chats-repo/claude-chats ~/bin/claude-chats
+ln -s ~/claude-chats-repo/codex-chats  ~/bin/codex-chats   # ~/bin must be on PATH
 ```
 
 ## How it works

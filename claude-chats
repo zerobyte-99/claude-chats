@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Manage saved Claude Code and Codex chats: list, rename, delete, move.
+"""Manage saved Claude Code or Codex chats: list, rename, delete, move.
 
-  claude-chats list [-t TOOL] [-p SUBSTR] [-a] [-n N]
-  claude-chats rename ID TITLE
-  claude-chats delete ID [ID...] [-y]
-  claude-chats move ID [ID...] DEST_DIR [-y]
+  claude-chats list [-p SUBSTR] [-a] [-n N]     (Claude Code chats)
+  codex-chats  list [-p SUBSTR] [-a] [-n N]     (Codex chats)
+  {claude,codex}-chats rename ID TITLE
+  {claude,codex}-chats delete ID [ID...] [-y]
+  {claude,codex}-chats move ID [ID...] DEST_DIR [-y]
 
-ID is any unambiguous prefix of a session id (Claude and Codex ids are looked
-up together). TOOL is claude, codex or all (default). Honors CLAUDE_CONFIG_DIR
-and CODEX_HOME.
+The tool is chosen by the command name (codex-chats is a symlink to this
+script). ID is any unambiguous prefix of a session id. Honors
+CLAUDE_CONFIG_DIR and CODEX_HOME.
 
 Claude: ~/.claude/projects/<encoded-cwd>/<id>.jsonl
 Codex:  ~/.codex/sessions/Y/M/D/rollout-*-<id>.jsonl + state_5.sqlite
@@ -252,10 +253,11 @@ BACKENDS = {
 
 # ------------------------------------------------------------------- CLI
 
-def all_chats(tool="all"):
-    for name, (lister, *_rest) in BACKENDS.items():
-        if tool in ("all", name):
-            yield from lister()
+TOOL = "codex" if Path(sys.argv[0]).name.startswith("codex") else "claude"
+
+
+def all_chats():
+    yield from BACKENDS[TOOL][0]()
 
 
 def resolve(prefix):
@@ -263,7 +265,7 @@ def resolve(prefix):
     if not hits:
         sys.exit(f"no chat matches '{prefix}'")
     if len(hits) > 1:
-        sys.exit(f"'{prefix}' is ambiguous: " + ", ".join(f"{h.tool}:{h.id[:12]}" for h in hits))
+        sys.exit(f"'{prefix}' is ambiguous: " + ", ".join(h.id[:12] for h in hits))
     return hits[0]
 
 
@@ -274,7 +276,7 @@ def confirm(msg, yes):
 def cmd_list(a):
     cwd = str(Path.cwd())
     rows = []
-    for c in all_chats(a.tool):
+    for c in all_chats():
         if a.project:
             if a.project not in c.cwd:
                 continue
@@ -286,10 +288,10 @@ def cmd_list(a):
         when = datetime.fromtimestamp(c.mtime).strftime("%Y-%m-%d %H:%M")
         kb = c.path.stat().st_size // 1024
         flag = f" [{c.note}]" if c.note else ""
-        print(f"{c.tool:<6} {c.id[:8]}  {when}  {c.msgs:>5} msgs {kb:>6}K  {c.title or '(untitled)'}{flag}")
-        print(f"       {c.cwd}")
+        print(f"{c.id[:8]}  {when}  {c.msgs:>5} msgs {kb:>6}K  {c.title or '(untitled)'}{flag}")
+        print(f"          {c.cwd}")
         if not c.title and c.first:
-            print(f"       > {c.first[:90]}")
+            print(f"          > {c.first[:90]}")
     if not rows:
         print("no chats (try -a for all projects)")
 
@@ -297,15 +299,15 @@ def cmd_list(a):
 def cmd_rename(a):
     c = resolve(a.id)
     BACKENDS[c.tool][1](c, a.title)
-    print(f"renamed {c.tool}:{c.id[:8]} -> {a.title}")
+    print(f"renamed {c.id[:8]} -> {a.title}")
 
 
 def cmd_delete(a):
     for i in a.ids:
         c = resolve(i)
-        if confirm(f"delete {c.tool}:{c.id[:8]} '{c.title or c.first[:40] or '(untitled)'}' ({c.cwd})?", a.yes):
+        if confirm(f"delete {c.id[:8]} '{c.title or c.first[:40] or '(untitled)'}' ({c.cwd})?", a.yes):
             BACKENDS[c.tool][2](c)
-            print(f"deleted {c.tool}:{c.id[:8]}")
+            print(f"deleted {c.id[:8]}")
 
 
 def cmd_move(a):
@@ -314,17 +316,16 @@ def cmd_move(a):
         print(f"warning: {dest} does not exist", file=sys.stderr)
     for i in a.ids:
         c = resolve(i)
-        if not confirm(f"move {c.tool}:{c.id[:8]} from {c.cwd} to {dest}?", a.yes):
+        if not confirm(f"move {c.id[:8]} from {c.cwd} to {dest}?", a.yes):
             continue
         err = BACKENDS[c.tool][3](c, dest)
-        print(f"skip {c.tool}:{c.id[:8]}: {err}" if err else f"moved {c.tool}:{c.id[:8]} -> {dest}")
+        print(f"skip {c.id[:8]}: {err}" if err else f"moved {c.id[:8]} -> {dest}")
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(prog=Path(sys.argv[0]).name, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("list", help="list chats (current dir by default)")
-    s.add_argument("-t", "--tool", choices=["claude", "codex", "all"], default="all")
     s.add_argument("-p", "--project", help="substring of the chat's working directory")
     s.add_argument("-a", "--all", action="store_true", help="all directories")
     s.add_argument("-n", "--limit", type=int, help="show only the newest N")
