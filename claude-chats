@@ -1,72 +1,269 @@
 #!/usr/bin/env python3
-"""Manage Claude Code saved chats: list, rename, delete, move.
+"""Manage saved Claude Code and Codex chats: list, rename, delete, move.
 
-Chats live in ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl, with an
-optional sibling <session-id>/ directory (subagents, tool results).
-
-  claude-chats list [-p PROJECT] [-a] [-n N]
+  claude-chats list [-t TOOL] [-p SUBSTR] [-a] [-n N]
   claude-chats rename ID TITLE
   claude-chats delete ID [ID...] [-y]
   claude-chats move ID [ID...] DEST_DIR [-y]
 
-ID may be any unambiguous prefix of the session id. PROJECT filters on a
-substring of the project path.
+ID is any unambiguous prefix of a session id (Claude and Codex ids are looked
+up together). TOOL is claude, codex or all (default). Honors CLAUDE_CONFIG_DIR
+and CODEX_HOME.
+
+Claude: ~/.claude/projects/<encoded-cwd>/<id>.jsonl
+Codex:  ~/.codex/sessions/Y/M/D/rollout-*-<id>.jsonl + state_5.sqlite
 """
 import argparse
 import json
+import os
 import re
 import shutil
+import sqlite3
 import sys
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path.home() / ".claude" / "projects"
+CLAUDE = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
+CODEX = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+
+
+@dataclass
+class Chat:
+    tool: str
+    id: str
+    path: Path
+    title: str
+    cwd: str
+    first: str
+    msgs: int
+    mtime: float
+    note: str = ""
 
 
 def encode(path):
     return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
-def scan(path):
-    """Return (title, cwd, first_prompt, nmsgs) from one transcript."""
-    custom = agent = ai = cwd = first = None
-    n = 0
-    with open(path, errors="replace") as fh:
-        for line in fh:
+def text_of(content):
+    if isinstance(content, list):
+        content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return " ".join(content.split()) if isinstance(content, str) else ""
+
+
+# ---------------------------------------------------------------- Claude
+
+def claude_chats():
+    for f in CLAUDE.glob("*/*.jsonl"):
+        custom = agent = ai = cwd = first = None
+        n = 0
+        with open(f, errors="replace") as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                t = o.get("type")
+                if t == "custom-title":
+                    custom = o.get("customTitle") or custom
+                elif t == "agent-name":
+                    agent = o.get("agentName") or agent
+                elif t == "ai-title":
+                    ai = o.get("aiTitle") or ai
+                elif t in ("user", "assistant"):
+                    n += 1
+                    cwd = cwd or o.get("cwd")
+                    if t == "user" and first is None and not o.get("isSidechain"):
+                        s = text_of(o.get("message", {}).get("content"))
+                        if s and not s.startswith("<"):
+                            first = s
+        yield Chat("claude", f.stem, f, custom or agent or ai or "", cwd or f.parent.name,
+                   first or "", n, f.stat().st_mtime)
+
+
+def claude_rename(c, title):
+    with open(c.path, "a") as fh:
+        fh.write(json.dumps({"type": "custom-title", "customTitle": title, "sessionId": c.id}) + "\n")
+        fh.write(json.dumps({"type": "agent-name", "agentName": title, "sessionId": c.id}) + "\n")
+
+
+def claude_delete(c):
+    c.path.unlink()
+    side = c.path.with_suffix("")
+    if side.is_dir():
+        shutil.rmtree(side)
+
+
+def claude_move(c, dest):
+    ddir = CLAUDE / encode(dest)
+    if c.path.parent == ddir:
+        return "already there"
+    if (ddir / c.path.name).exists():
+        return "already exists in destination"
+    ddir.mkdir(parents=True, exist_ok=True)
+    tmp = ddir / (c.path.name + ".tmp")
+    rewrite(c.path, tmp, lambda o: o.update(cwd=str(dest)) if "cwd" in o else None)
+    tmp.replace(ddir / c.path.name)
+    c.path.unlink()
+    side = c.path.with_suffix("")
+    if side.is_dir():
+        shutil.move(str(side), str(ddir / side.name))
+
+
+def rewrite(src, dst, fn):
+    """Copy a jsonl, applying fn(obj) to each parseable line; others pass through."""
+    with open(src, errors="surrogateescape") as i, open(dst, "w", errors="surrogateescape") as o:
+        for line in i:
             try:
-                o = json.loads(line)
+                obj = json.loads(line)
             except ValueError:
+                o.write(line)
                 continue
-            t = o.get("type")
-            if t == "custom-title":
-                custom = o.get("customTitle") or custom
-            elif t == "agent-name":
-                agent = o.get("agentName") or agent
-            elif t == "ai-title":
-                ai = o.get("aiTitle") or ai
-            elif t in ("user", "assistant"):
-                n += 1
-                cwd = cwd or o.get("cwd")
-                if t == "user" and first is None and not o.get("isSidechain"):
-                    c = o.get("message", {}).get("content")
-                    if isinstance(c, list):
-                        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
-                    if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
-                        first = " ".join(c.split())
-    return custom or agent or ai or "", cwd, first or "", n
+            if isinstance(obj, dict):
+                fn(obj)
+                line = json.dumps(obj, ensure_ascii=False) + "\n"
+            o.write(line)
 
 
-def chats():
-    for f in ROOT.glob("*/*.jsonl"):
-        yield f
+# ----------------------------------------------------------------- Codex
+
+def codex_db(write=False):
+    p = CODEX / "state_5.sqlite"
+    if not p.exists():
+        return None
+    if write:
+        db = sqlite3.connect(p, timeout=10)
+        db.execute("PRAGMA foreign_keys=ON")
+    else:
+        db = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=10)
+    return db
+
+
+def codex_rollouts():
+    yield from (CODEX / "sessions").glob("*/*/*/rollout-*.jsonl")
+    yield from (CODEX / "archived_sessions").glob("rollout-*.jsonl")
+
+
+def codex_chats():
+    rows = {}
+    db = codex_db()
+    if db:
+        for tid, name, title, thread_source, arch in db.execute(
+                "select id, name, title, thread_source, archived from threads"):
+            rows[tid] = (name or title or "", thread_source, arch)
+        db.close()
+    for f in codex_rollouts():
+        m = re.search(r"-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", f.name)
+        if not m:
+            continue
+        tid = m.group(1)
+        name, src, arch = rows.get(tid, ("", None, 0))
+        if src not in (None, "user"):
+            continue  # hide guardian-review and other subagent threads
+        cwd = first = None
+        n = 0
+        with open(f, errors="replace") as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                p = o.get("payload") or {}
+                t = o.get("type")
+                if t == "session_meta":
+                    cwd = p.get("cwd")
+                elif t == "response_item" and p.get("type") == "message" and p.get("role") in ("user", "assistant"):
+                    n += 1
+                    if first is None and p["role"] == "user":
+                        s = text_of([{"text": b.get("text", "")} for b in p.get("content", []) if isinstance(b, dict)])
+                        if s and not s.startswith(("<", "# AGENTS")):
+                            first = s
+        yield Chat("codex", tid, f, name, cwd or "", first or "", n, f.stat().st_mtime,
+                   "archived" if arch or f.parent.name == "archived_sessions" else "")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def index_edit(tid, append=None):
+    """Drop a thread's session_index.jsonl entries, or append a new one."""
+    p = CODEX / "session_index.jsonl"
+    keep = []
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                if append is None and json.loads(line).get("id") == tid:
+                    continue
+            except ValueError:
+                pass
+            keep.append(line)
+    if append:
+        keep.append(json.dumps(append))
+    p.write_text("".join(l + "\n" for l in keep))
+
+
+def codex_rename(c, title):
+    db = codex_db(write=True)
+    if db:
+        with db:
+            db.execute("update threads set name=? where id=?", (title, c.id))
+        db.close()
+    index_edit(c.id, {"id": c.id, "thread_name": title, "updated_at": now_iso()})
+
+
+def codex_delete(c):
+    c.path.unlink()
+    db = codex_db(write=True)
+    if db:
+        with db:
+            db.execute("delete from thread_spawn_edges where parent_thread_id=? or child_thread_id=?",
+                       (c.id, c.id))
+            db.execute("delete from thread_read_receipts where thread_id=?", (c.id,))
+            db.execute("delete from threads where id=?", (c.id,))
+        db.close()
+    index_edit(c.id)
+
+
+def codex_move(c, dest):
+    if c.cwd == str(dest):
+        return "already there"
+
+    def fix(o):
+        if o.get("type") in ("session_meta", "turn_context") and isinstance(o.get("payload"), dict):
+            if "cwd" in o["payload"]:
+                o["payload"]["cwd"] = str(dest)
+
+    tmp = c.path.with_name(c.path.name + ".tmp")
+    rewrite(c.path, tmp, fix)
+    tmp.replace(c.path)
+    db = codex_db(write=True)
+    if db:
+        with db:
+            db.execute("update threads set cwd=? where id=?", (str(dest), c.id))
+        db.close()
+
+
+BACKENDS = {
+    "claude": (claude_chats, claude_rename, claude_delete, claude_move),
+    "codex": (codex_chats, codex_rename, codex_delete, codex_move),
+}
+
+
+# ------------------------------------------------------------------- CLI
+
+def all_chats(tool="all"):
+    for name, (lister, *_rest) in BACKENDS.items():
+        if tool in ("all", name):
+            yield from lister()
 
 
 def resolve(prefix):
-    hits = [f for f in chats() if f.stem.startswith(prefix)]
+    hits = [c for c in all_chats() if c.id.startswith(prefix)]
     if not hits:
         sys.exit(f"no chat matches '{prefix}'")
     if len(hits) > 1:
-        sys.exit(f"'{prefix}' is ambiguous: " + ", ".join(h.stem[:12] for h in hits))
+        sys.exit(f"'{prefix}' is ambiguous: " + ", ".join(f"{h.tool}:{h.id[:12]}" for h in hits))
     return hits[0]
 
 
@@ -75,95 +272,61 @@ def confirm(msg, yes):
 
 
 def cmd_list(a):
+    cwd = str(Path.cwd())
     rows = []
-    cur = encode(Path.cwd())
-    for f in chats():
+    for c in all_chats(a.tool):
         if a.project:
-            if a.project not in f.parent.name:
+            if a.project not in c.cwd:
                 continue
-        elif not a.all and f.parent.name != cur:
+        elif not a.all and c.cwd != cwd:
             continue
-        title, cwd, first, n = scan(f)
-        rows.append((f.stat().st_mtime, f, title, cwd, first, n))
-    rows.sort(key=lambda r: r[0], reverse=True)
-    if a.limit:
-        rows = rows[: a.limit]
-    for mt, f, title, cwd, first, n in rows:
-        when = datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M")
-        kb = f.stat().st_size // 1024
-        print(f"{f.stem[:8]}  {when}  {n:>5} msgs {kb:>6}K  {title or '(untitled)'}")
-        print(f"          {cwd or f.parent.name}")
-        if not title and first:
-            print(f"          > {first[:90]}")
+        rows.append(c)
+    rows.sort(key=lambda c: c.mtime, reverse=True)
+    for c in rows[: a.limit or None]:
+        when = datetime.fromtimestamp(c.mtime).strftime("%Y-%m-%d %H:%M")
+        kb = c.path.stat().st_size // 1024
+        flag = f" [{c.note}]" if c.note else ""
+        print(f"{c.tool:<6} {c.id[:8]}  {when}  {c.msgs:>5} msgs {kb:>6}K  {c.title or '(untitled)'}{flag}")
+        print(f"       {c.cwd}")
+        if not c.title and c.first:
+            print(f"       > {c.first[:90]}")
     if not rows:
         print("no chats (try -a for all projects)")
 
 
 def cmd_rename(a):
-    f = resolve(a.id)
-    rec = {"type": "custom-title", "customTitle": a.title, "sessionId": f.stem}
-    rec2 = {"type": "agent-name", "agentName": a.title, "sessionId": f.stem}
-    with open(f, "a") as fh:
-        fh.write(json.dumps(rec) + "\n" + json.dumps(rec2) + "\n")
-    print(f"renamed {f.stem[:8]} -> {a.title}")
+    c = resolve(a.id)
+    BACKENDS[c.tool][1](c, a.title)
+    print(f"renamed {c.tool}:{c.id[:8]} -> {a.title}")
 
 
 def cmd_delete(a):
     for i in a.ids:
-        f = resolve(i)
-        title = scan(f)[0] or "(untitled)"
-        if not confirm(f"delete {f.stem[:8]} '{title}' in {f.parent.name}?", a.yes):
-            continue
-        f.unlink()
-        side = f.with_suffix("")
-        if side.is_dir():
-            shutil.rmtree(side)
-        print(f"deleted {f.stem[:8]}")
+        c = resolve(i)
+        if confirm(f"delete {c.tool}:{c.id[:8]} '{c.title or c.first[:40] or '(untitled)'}' ({c.cwd})?", a.yes):
+            BACKENDS[c.tool][2](c)
+            print(f"deleted {c.tool}:{c.id[:8]}")
 
 
 def cmd_move(a):
     dest = Path(a.dest).expanduser().resolve()
-    ddir = ROOT / encode(dest)
     if not dest.is_dir():
         print(f"warning: {dest} does not exist", file=sys.stderr)
     for i in a.ids:
-        f = resolve(i)
-        if f.parent == ddir:
-            print(f"{f.stem[:8]} already in {dest}")
+        c = resolve(i)
+        if not confirm(f"move {c.tool}:{c.id[:8]} from {c.cwd} to {dest}?", a.yes):
             continue
-        if (ddir / f.name).exists():
-            print(f"skip {f.stem[:8]}: already exists in destination", file=sys.stderr)
-            continue
-        if not confirm(f"move {f.stem[:8]} from {f.parent.name} to {ddir.name}?", a.yes):
-            continue
-        ddir.mkdir(parents=True, exist_ok=True)
-        # rewrite cwd so --resume from the new directory sees consistent data
-        tmp = ddir / (f.name + ".tmp")
-        with open(f, errors="surrogateescape") as src, open(tmp, "w", errors="surrogateescape") as out:
-            for line in src:
-                try:
-                    o = json.loads(line)
-                except ValueError:
-                    out.write(line)
-                    continue
-                if isinstance(o, dict) and "cwd" in o:
-                    o["cwd"] = str(dest)
-                    line = json.dumps(o, ensure_ascii=False) + "\n"
-                out.write(line)
-        tmp.replace(ddir / f.name)
-        f.unlink()
-        side = f.with_suffix("")
-        if side.is_dir():
-            shutil.move(str(side), str(ddir / side.name))
-        print(f"moved {f.stem[:8]} -> {dest}")
+        err = BACKENDS[c.tool][3](c, dest)
+        print(f"skip {c.tool}:{c.id[:8]}: {err}" if err else f"moved {c.tool}:{c.id[:8]} -> {dest}")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("list", help="list chats (current dir by default)")
-    s.add_argument("-p", "--project", help="substring of project path")
-    s.add_argument("-a", "--all", action="store_true", help="all projects")
+    s.add_argument("-t", "--tool", choices=["claude", "codex", "all"], default="all")
+    s.add_argument("-p", "--project", help="substring of the chat's working directory")
+    s.add_argument("-a", "--all", action="store_true", help="all directories")
     s.add_argument("-n", "--limit", type=int, help="show only the newest N")
     s.set_defaults(fn=cmd_list)
     s = sub.add_parser("rename")
